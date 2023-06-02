@@ -9,13 +9,12 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
-	"time"
 )
 
 type Command struct {
