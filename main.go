@@ -2,137 +2,156 @@ package main
 
 // Cloud build agent, he will be responsible for the execution of every command inside of the environment and for the communication with the server to update the environment status
 // The agent will be a go routine that will be running inside of the environment instance and will be responsible for the execution of every command inside of the environment and for the communication with the server to update the environment status
-// Will be established a websocket connection between the agent and the server backend to allow the server to send commands to the agent and to allow the agent to send the environment status to the server
-// The agent will be responsible for the execution of every command inside of the environment and for the communication with the server to update the environment status
-// He will listen for commands from the server and execute them inside of the environment
+// Will be established a connection with the server and the agent will be waiting for commands to execute
+// The agent will be responsible for the execution of the commands and for the communication with the server to update the environment status
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
+	"net"
+	"os"
 	"os/exec"
-
-	"github.com/gorilla/websocket"
+	"strings"
+	"sync"
+	"time"
 )
 
-var (
-	commandChannel = make(chan string)
-	statusChannel  = make(chan string)
-	upgrader       = websocket.Upgrader{}
-)
+type Command struct {
+	Command string `json:"command"`
+}
 
 func main() {
-	// establish the websocket connection
-	conn, err := establishWebSocketConnection()
+	listenPort := "80"
+
+	// Start listening on port 80 for incoming connections
+	listener, err := net.Listen("tcp", ":"+listenPort)
 	if err != nil {
-		log.Fatal("Failed to establish websocket connection:", err)
+		log.Fatalf("Failed to start listener on port %s: %s", listenPort, err)
 	}
+	defer listener.Close()
+	log.Printf("Agent is listening on port %s", listenPort)
 
-	// listen for commands from the server
-	go listenForCommands(conn)
-
-	// execute the commands inside the environment
-	go executeCommands()
-
-	// send the environment status to the server
-	go sendStatusUpdates(conn)
-
-	// create a file log to indicate that the agent is running
-	_, err = exec.Command("touch", "/tmp/agent.log").Output()
-	if err != nil {
-		log.Println("Failed to create agent log file:", err)
-	}
-
-	// keep the agent running
-	select {}
-}
-
-func establishWebSocketConnection() (*websocket.Conn, error) {
-	http.HandleFunc("/execute", func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			log.Println("Failed to upgrade connection to WebSocket:", err)
-			return
-		}
-		defer conn.Close()
-
-		// Handle incoming messages from the client
-		for {
-			_, commandBytes, err := conn.ReadMessage()
-			if err != nil {
-				log.Println("Failed to read command:", err)
-				return
-			}
-
-			command := string(commandBytes)
-			commandChannel <- command
-		}
-	})
-
-	// Replace the port number with the desired port
-	port := "8080"
-	log.Println("Starting WebSocket server on port", port)
-	err := http.ListenAndServe(":"+port, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	// This code will never be reached since ListenAndServe is blocking.
-	// Return an error just for consistency.
-	return nil, fmt.Errorf("WebSocket server terminated unexpectedly")
-}
-
-func listenForCommands(conn *websocket.Conn) {
+	// Wait for incoming connections and handle them concurrently
 	for {
-		_, commandBytes, err := conn.ReadMessage()
+		conn, err := listener.Accept()
 		if err != nil {
-			log.Println("Failed to read command:", err)
+			log.Printf("Failed to accept connection: %s", err)
 			continue
 		}
 
-		command := string(commandBytes)
-		commandChannel <- command
+		go handleConnection(conn)
 	}
 }
 
-func executeCommands() {
-	for command := range commandChannel {
-		// Execute the command inside the environment
-		cmd := exec.Command("/bin/sh", "-c", command)
-		output, err := cmd.CombinedOutput()
+func handleConnection(conn net.Conn) {
+	defer conn.Close()
 
-		// Prepare the response with the command output
-		response := struct {
-			Command string `json:"command"`
-			Output  string `json:"output"`
-			Error   string `json:"error"`
-		}{
-			Command: command,
-			Output:  string(output),
-			Error:   "",
-		}
-		if err != nil {
-			response.Error = err.Error()
-		}
+	// Read the incoming command
+	commandBytes, err := bufio.NewReader(conn).ReadBytes('\n')
+	if err != nil {
+		log.Printf("Failed to read command: %s", err)
+		return
+	}
 
-		responseBytes, err := json.Marshal(response)
-		if err != nil {
-			log.Println("Failed to marshal response:", err)
-			continue
-		}
+	// Unmarshal the command JSON
+	var command Command
+	err = json.Unmarshal(commandBytes, &command)
+	if err != nil {
+		log.Printf("Failed to unmarshal command: %s", err)
+		return
+	}
 
-		// Send the command execution response to the status channel
-		statusChannel <- string(responseBytes)
+	// Execute the command inside the environment
+	output, err := executeCommand(command.Command)
+	if err != nil {
+		log.Printf("Failed to execute command '%s': %s", command.Command, err)
+		return
+	}
+
+	// Prepare the response with the command output
+	response := struct {
+		Command string `json:"command"`
+		Output  string `json:"output"`
+	}{
+		Command: command.Command,
+		Output:  output,
+	}
+
+	// Marshal the response to JSON
+	responseBytes, err := json.Marshal(response)
+	if err != nil {
+		log.Printf("Failed to marshal response: %s", err)
+		return
+	}
+
+	// Send the response back to the client
+	_, err = conn.Write(responseBytes)
+	if err != nil {
+		log.Printf("Failed to send response: %s", err)
+		return
 	}
 }
 
-func sendStatusUpdates(conn *websocket.Conn) {
-	for status := range statusChannel {
-		// Send the environment status update to the server
-		err := conn.WriteMessage(websocket.TextMessage, []byte(status))
-		if err != nil {
-			log.Println("Failed to send status update:", err)
-		}
+func executeCommand(command string) (string, error) {
+	// Split the command into the command and its arguments
+	parts := strings.Fields(command)
+	cmd := exec.Command(parts[0], parts[1:]...)
+
+	// Set up the command's output and error pipes
+	cmdOutput, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", fmt.Errorf("failed to create stdout pipe: %s", err)
 	}
+	cmdError, err := cmd.StderrPipe()
+	if err != nil {
+		return "", fmt.Errorf("failed to create stderr pipe: %s", err)
+	}
+
+	// Start the command
+	err = cmd.Start()
+	if err != nil {
+		return "", fmt.Errorf("failed to start command: %s", err)
+	}
+
+	// Read the output and error asynchronously
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	var output, errorOutput string
+
+	go func() {
+		defer wg.Done()
+		output, _ = readAllLines(cmdOutput)
+	}()
+
+	go func() {
+		defer wg.Done()
+		errorOutput, _ = readAllLines(cmdError)
+	}()
+
+	// Wait for the command to finish and get the exit status
+	err = cmd.Wait()
+	wg.Wait()
+
+	if err != nil {
+		return "", fmt.Errorf("command failed: %s", err)
+	}
+
+	// Combine the output and error output
+	result := output + errorOutput
+	return result, nil
+}
+
+func readAllLines(reader io.Reader) (string, error) {
+	scanner := bufio.NewScanner(reader)
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return strings.Join(lines, "\n"), nil
 }
