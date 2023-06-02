@@ -38,10 +38,10 @@ func main() {
 	// send the environment status to the server
 	go sendStatusUpdates(conn)
 
-	// create a file log in the root to indicate that the agent is running
-	_, err = exec.Command("/bin/sh", "-c", "touch /agent.log").CombinedOutput()
+	// create a file log to indicate that the agent is running
+	_, err = exec.Command("touch", "/tmp/agent.log").Output()
 	if err != nil {
-		log.Println("Failed to create agent log:", err)
+		log.Println("Failed to create agent log file:", err)
 	}
 
 	// keep the agent running
